@@ -71,24 +71,40 @@ def build_log_view_tab(tab, db_name):
             tree.delete(row)
         with sqlite3.connect(db_name) as conn:
             cursor = conn.cursor()
-            cursor.execute(f"SELECT username, action, filename, timestamp FROM {LOG_TABLE} ORDER BY timestamp DESC")
+            cursor.execute(f"SELECT id, username, action, filename, timestamp FROM {LOG_TABLE} ORDER BY timestamp DESC")
             for row in cursor.fetchall():
-                tree.insert("", "end", values=row)
+                tree.insert("", "end", iid=row[0], values=row[1:])
 
     refresh_button = tk.Button(frame, text="重新整理", command=refresh_logs)
     refresh_button.pack(anchor="e", pady=5)
 
+    def delete_selected_log():
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("提醒", "請先選取一筆操作紀錄")
+            return
+        if messagebox.askyesno("確認", "確定要刪除所選操作紀錄？"):
+            with sqlite3.connect(db_name) as conn:
+                cursor = conn.cursor()
+                for iid in selected:
+                    cursor.execute(f"DELETE FROM {LOG_TABLE} WHERE id=?", (iid,))
+                conn.commit()
+            refresh_logs()
+    def delete_all_logs():
+        if messagebox.askyesno("確認", "⚠️ 確定要刪除所有操作紀錄？此操作無法復原。"):
+            with sqlite3.connect(db_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"DELETE FROM {LOG_TABLE}")
+                conn.commit()
+            refresh_logs()
+
+    # 下方按鈕列
+    button_frame = tk.Frame(frame)
+    button_frame.pack(anchor="e", pady=5)
+
+    tk.Button(button_frame, text="刪除所選", command=delete_selected_log).pack(side="left", padx=5)
+    tk.Button(button_frame, text="刪除全部", command=delete_all_logs).pack(side="left", padx=5)
     refresh_logs()
-
-
-def refresh_logs():
-        for row in tree.get_children():
-            tree.delete(row)
-        with sqlite3.connect(db_name) as conn:
-            cursor = conn.cursor()
-            cursor.execute(f"SELECT username, action, filename, timestamp FROM {LOG_TABLE} ORDER BY timestamp DESC")
-            for row in cursor.fetchall():
-                tree.insert("", "end", values=row)
                 
 def initialize_database():
     with sqlite3.connect(DB_NAME) as conn:
@@ -254,7 +270,7 @@ def create_main_interface(root, db_name, login_info):
             cursor = conn.cursor()
             cursor.execute("SELECT product_code FROM issues WHERE product_code=?", (code,))
             if cursor.fetchone():
-                messagebox.showerror("錯誤", "產品編號已存在，請改用更新功能")
+                messagebox.showerror("錯誤", "產品編號已存在，請重新確認過。")
                 return
 
             a_path = save_file(entry_assembly.get().strip(), ASSEMBLY_SOP_PATH, current_user)
@@ -298,6 +314,27 @@ def create_main_interface(root, db_name, login_info):
         tree.column(col, width=120)
     tree.pack(fill="both", expand=True, padx=10, pady=5)
 
+    if current_role == "admin":
+        def delete_selected():
+            selected_items = tree.selection()
+            if not selected_items:
+                messagebox.showwarning("提醒", "請先選取要刪除的資料")
+                return
+            if messagebox.askyesno("確認", "確定要刪除選取的資料？此操作無法復原。"):
+                with sqlite3.connect(db_name) as conn:
+                    cursor = conn.cursor()
+                    for item in selected_items:
+                        product_code = tree.item(item)['values'][0]
+                        cursor.execute("DELETE FROM issues WHERE product_code=?", (product_code,))
+                        log_activity(current_user, "delete", product_code)
+                    conn.commit()
+                query_data()
+
+        delete_frame = tk.Frame(frame)
+        delete_frame.pack(fill="x", padx=10, pady=(0, 5), anchor="e")
+
+        tk.Button(delete_frame, text="刪除選取資料", command=delete_selected,
+                  bg="lightcoral", fg="white").pack(side="right")
     def query_data():
         keyword = entry_query.get().strip()
         for row in tree.get_children():
@@ -339,7 +376,7 @@ def create_main_interface(root, db_name, login_info):
         root.clipboard_clear()
         root.clipboard_append(str(value))
         root.update()
-
+        
     tree.bind("<Double-1>", on_double_click)
     tree.bind("<Control-c>", on_copy)
 
