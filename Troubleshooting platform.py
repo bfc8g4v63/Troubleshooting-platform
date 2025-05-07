@@ -1,334 +1,413 @@
-import os
-import sqlite3
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
+import sqlite3
+import os
+import shutil
+import hashlib
+import subprocess
+import sys
+
+from account_management_tab import build_user_management_tab
 
 DB_NAME = "troubleshooting.db"
 
-# === 資料庫初始化 ===
-with sqlite3.connect(DB_NAME) as conn:
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS issues (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_code TEXT NOT NULL,
-            product_name TEXT,
-            status TEXT,
-            change TEXT,
-            file_path TEXT,
-            created_by TEXT,
-            created_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password TEXT,
-            role TEXT DEFAULT 'user',
-            can_add INTEGER DEFAULT 1,
-            can_delete INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1
-        )
-    """)
-    cursor.execute("SELECT COUNT(*) FROM users WHERE username='Nelson'")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO users (username, password, role, can_add, can_delete, active) VALUES (?, ?, ?, ?, ?, ?)",
-                       ("Nelson", "8463", "admin", 1, 1, 1))
-    conn.commit()
+ASSEMBLY_SOP_PATH = r"\\192.120.100.177\工程部\生產管理\生產管理平台\組裝SOP"
+TEST_SOP_PATH = r"\\192.120.100.177\工程部\生產管理\生產管理平台\測試SOP"
+PACKAGING_SOP_PATH = r"\\192.120.100.177\工程部\生產管理\生產管理平台\包裝SOP"
+OQC_PATH = r"\\192.120.100.177\工程部\生產管理\生產管理平台\檢查表OQC"
 
-# === 登入視窗 ===
-def login(root):
-    login_success = {"user": None, "role": None, "can_add": 0, "can_delete": 0}
+LOG_TABLE = "activity_logs"
 
-    def attempt_login():
-        username = entry_user.get().strip()
-        password = entry_pass.get().strip()
-        if not username or not password:
-            messagebox.showerror("錯誤", "請輸入帳號與密碼")
+
+def hash_password(password):
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+
+def log_activity(user, action, filename):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                action TEXT,
+                filename TEXT,
+                timestamp TEXT
+            )
+        """)
+        cursor.execute(f"""
+            INSERT INTO {LOG_TABLE} (username, action, filename, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (user, action, filename, datetime.now().isoformat()))
+        conn.commit()
+
+def open_file(filepath):
+    try:
+        if sys.platform == "win32":
+            os.startfile(filepath)
+        elif sys.platform == "darwin":
+            subprocess.call(["open", filepath])
+        else:
+            subprocess.call(["xdg-open", filepath])
+    except Exception as e:
+        messagebox.showerror("錯誤", f"無法開啟檔案: {e}")
+
+def build_log_view_tab(tab, db_name):
+    frame = tk.Frame(tab)
+    frame.pack(fill="both", expand=True, padx=10, pady=10)
+    tk.Label(frame, text="操作紀錄查詢（僅限管理者）").pack(anchor="w")
+
+    columns = ("使用者", "動作", "檔案名稱", "時間")
+    tree = ttk.Treeview(frame, columns=columns, show="headings")
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=150)
+    tree.pack(fill="both", expand=True)
+
+    def refresh_logs():
+        for row in tree.get_children():
+            tree.delete(row)
+        with sqlite3.connect(db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT username, action, filename, timestamp FROM {LOG_TABLE} ORDER BY timestamp DESC")
+            for row in cursor.fetchall():
+                tree.insert("", "end", values=row)
+
+    refresh_button = tk.Button(frame, text="重新整理", command=refresh_logs)
+    refresh_button.pack(anchor="e", pady=5)
+
+    refresh_logs()
+
+
+def refresh_logs():
+        for row in tree.get_children():
+            tree.delete(row)
+        with sqlite3.connect(db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT username, action, filename, timestamp FROM {LOG_TABLE} ORDER BY timestamp DESC")
+            for row in cursor.fetchall():
+                tree.insert("", "end", values=row)
+                
+def initialize_database():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS issues (
+                product_code TEXT PRIMARY KEY,
+                product_name TEXT,
+                assembly_sop TEXT,
+                test_sop TEXT,
+                packaging_sop TEXT,
+                oqc_checklist TEXT,
+                created_by TEXT,
+                created_at TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT,
+                role TEXT DEFAULT 'user',
+                can_add INTEGER DEFAULT 1,
+                can_delete INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1
+            )
+        """)
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                action TEXT,
+                filename TEXT,
+                timestamp TEXT
+            )
+        """)
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username='Nelson'")
+        if cursor.fetchone()[0] == 0:
+            hashed_pw = hash_password("8463")
+            cursor.execute("""
+                INSERT INTO users (username, password, role, can_add, can_delete, active)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, ("Nelson", hashed_pw, "admin", 1, 1, 1))
+        conn.commit()
+
+
+def save_file(file_path, target_folder, username):
+    if not os.path.exists(file_path):
+        return ""
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    filename = f"{timestamp}_{os.path.basename(file_path)}"
+    target_path = os.path.join(target_folder, filename)
+    try:
+        shutil.copy(file_path, target_path)
+        log_activity(username, "upload", filename)
+        return filename
+    except Exception as e:
+        messagebox.showerror("錯誤", f"檔案儲存失敗: {e}")
+        return ""
+
+
+def update_sop_field(cursor, product_code, field_name, new_file_path):
+    cursor.execute(f"UPDATE issues SET {field_name}=?, created_at=? WHERE product_code=?",
+                   (new_file_path, datetime.now().isoformat(), product_code))
+
+
+def handle_sop_update(product_code, sop_path, field_name, entry_widget, current_user):
+    path = entry_widget.get().strip()
+    if not path:
+        return None
+    filename = save_file(path, sop_path, current_user)
+    if not filename:
+        return None
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        update_sop_field(cursor, product_code, field_name, os.path.join(sop_path, filename))
+        conn.commit()
+    return filename
+
+
+def create_sop_update_button(frame, row, label, sop_path, field_name, product_code_entry, entry_widget, current_user):
+    def update_action():
+        product_code = product_code_entry.get().strip()
+        if not product_code:
+            messagebox.showwarning("警告", "請先輸入產品編號")
             return
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT role, can_add, can_delete FROM users WHERE username=? AND password=? AND active=1", (username, password))
-            result = cursor.fetchone()
-            if result:
-                login_success["user"] = username
-                login_success["role"] = result[0]
-                login_success["can_add"] = result[1]
-                login_success["can_delete"] = result[2]
-                login_window.destroy()
-            else:
-                messagebox.showerror("錯誤", "帳號或密碼錯誤或帳號已停用")
+        updated_filename = handle_sop_update(product_code, sop_path, field_name, entry_widget, current_user)
+        if updated_filename:
+            messagebox.showinfo("成功", f"已更新 {label} 檔案")
+    btn = tk.Button(frame, text="更新", command=update_action)
+    btn.grid(row=row, column=3, padx=5)
+    return btn
 
-    login_window = tk.Toplevel(root)
-    login_window.title("登入系統")
-    login_window.geometry("300x180")
-    login_window.resizable(False, False)
-    login_window.grab_set()
 
-    tk.Label(login_window, text="請輸入使用者名稱：").pack(pady=(15, 5))
-    entry_user = tk.Entry(login_window)
-    entry_user.pack()
-
-    tk.Label(login_window, text="請輸入密碼：").pack(pady=(10, 5))
-    entry_pass = tk.Entry(login_window, show="*")
-    entry_pass.pack()
-
-    tk.Button(login_window, text="登入", command=attempt_login).pack(pady=15)
-    login_window.protocol("WM_DELETE_WINDOW", root.destroy)
-
-    root.wait_window(login_window)
-    return login_success
-
-# === 刪除紀錄功能 ===
-def delete_record(tree):
-    selected = tree.selection()
-    if not selected:
-        messagebox.showwarning("未選擇", "請選取要刪除的紀錄")
-        return
-    if messagebox.askyesno("確認", "確定要刪除這些紀錄嗎？"):
-        ids = [tree.item(i)['values'][0] for i in selected]
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.executemany("DELETE FROM issues WHERE id=?", [(i,) for i in ids])
-        messagebox.showinfo("成功", "已刪除選取的紀錄")
-        return True
-    return False
-
-# === 使用者管理 ===
-def manage_users():
-    win = tk.Toplevel(root)
-    win.title("帳號管理")
-    win.geometry("700x500")
-
-    tk.Label(win, text="帳號:").grid(row=0, column=0)
-    entry_new_user = tk.Entry(win)
-    entry_new_user.grid(row=0, column=1)
-
-    tk.Label(win, text="密碼:").grid(row=1, column=0)
-    entry_new_pass = tk.Entry(win, show="*")
-    entry_new_pass.grid(row=1, column=1)
-
-    var_add = tk.IntVar(value=1)
-    var_delete = tk.IntVar(value=0)
-    var_active = tk.IntVar(value=1)
-    tk.Checkbutton(win, text="允許新增", variable=var_add).grid(row=2, column=1, sticky="w")
-    tk.Checkbutton(win, text="允許刪除", variable=var_delete).grid(row=3, column=1, sticky="w")
-    tk.Checkbutton(win, text="啟用帳號", variable=var_active).grid(row=4, column=1, sticky="w")
-
-    def add_user():
-        u = entry_new_user.get().strip()
-        p = entry_new_pass.get().strip()
-        if not u or not p:
-            messagebox.showwarning("錯誤", "請輸入帳號與密碼")
-            return
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("""
-                    INSERT INTO users (username, password, role, can_add, can_delete, active)
-                    VALUES (?, ?, 'user', ?, ?, ?)
-                """, (u, p, var_add.get(), var_delete.get(), var_active.get()))
-                messagebox.showinfo("成功", "使用者已新增")
-                entry_new_user.delete(0, tk.END)
-                entry_new_pass.delete(0, tk.END)
-                refresh_user_list()
-            except sqlite3.IntegrityError:
-                messagebox.showerror("錯誤", "帳號已存在")
-
-    tk.Button(win, text="新增使用者", command=add_user).grid(row=5, column=1, pady=10)
-
-    frame_list = tk.LabelFrame(win, text="現有使用者")
-    frame_list.grid(row=6, column=0, columnspan=3, pady=10, padx=10, sticky="nsew")
-    frame_list.columnconfigure(0, weight=1)
-
-    tree_users = ttk.Treeview(frame_list, columns=("帳號", "角色", "可新增", "可刪除", "啟用"), show="headings", height=10)
-    for col in ("帳號", "角色", "可新增", "可刪除", "啟用"):
-        tree_users.heading(col, text=col)
-        tree_users.column(col, width=100 if col != "帳號" else 150)
-    tree_users.pack(fill="both", expand=True)
-
-    tk.Label(win, text="選取帳號後可修改 ↓").grid(row=7, column=0, columnspan=2)
-
-    entry_edit_pass = tk.Entry(win, show="*")
-    entry_edit_pass.grid(row=8, column=1)
-    tk.Label(win, text="新密碼（選填）:").grid(row=8, column=0)
-
-    edit_add = tk.IntVar()
-    edit_delete = tk.IntVar()
-    edit_active = tk.IntVar()
-    tk.Checkbutton(win, text="允許新增", variable=edit_add).grid(row=9, column=1, sticky="w")
-    tk.Checkbutton(win, text="允許刪除", variable=edit_delete).grid(row=10, column=1, sticky="w")
-    tk.Checkbutton(win, text="啟用帳號", variable=edit_active).grid(row=11, column=1, sticky="w")
-
-    def on_user_select(event):
-        selected = tree_users.selection()
-        if not selected:
-            return
-        item = tree_users.item(selected[0])["values"]
-        edit_add.set(1 if item[2] else 0)
-        edit_delete.set(1 if item[3] else 0)
-        edit_active.set(1 if item[4] else 0)
-
-    def update_permissions():
-        selected = tree_users.selection()
-        if not selected:
-            messagebox.showwarning("未選擇", "請選擇帳號")
-            return
-        username = tree_users.item(selected[0])["values"][0]
-        new_pass = entry_edit_pass.get().strip()
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            if new_pass:
-                cursor.execute("""
-                    UPDATE users SET password=?, can_add=?, can_delete=?, active=? WHERE username=?
-                """, (new_pass, edit_add.get(), edit_delete.get(), edit_active.get(), username))
-            else:
-                cursor.execute("""
-                    UPDATE users SET can_add=?, can_delete=?, active=? WHERE username=?
-                """, (edit_add.get(), edit_delete.get(), edit_active.get(), username))
-        messagebox.showinfo("成功", "使用者權限已更新")
-        entry_edit_pass.delete(0, tk.END)
-        refresh_user_list()
-
-    tk.Button(win, text="更新權限/密碼", command=update_permissions).grid(row=12, column=1, pady=10)
-
-    def refresh_user_list():
-        for row in tree_users.get_children():
-            tree_users.delete(row)
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT username, role, can_add, can_delete, active FROM users")
-            for user in cursor.fetchall():
-                tree_users.insert('', tk.END, values=user)
-
-    tree_users.bind("<<TreeviewSelect>>", on_user_select)
-    refresh_user_list()
-
-# === 主程式 ===
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw()
-
-    login_info = login(root)
-    if not login_info["user"]:
-        root.destroy()
-        exit()
-
-    current_user = login_info["user"]
-    current_role = login_info["role"]
-    can_add = login_info["can_add"]
-    can_delete = login_info["can_delete"]
-
-    root.deiconify()
-    root.title("生產資訊平台")
-    root.geometry("1000x750")
-    tk.Label(root, text=f"登入者：{current_user} ({current_role})", anchor="e").pack(fill="x", padx=10, pady=5)
-
-    # === 表單區塊 ===
-    frame_form = tk.Frame(root)
-    frame_form.pack(pady=10)
-
-    tk.Label(frame_form, text="產品編號:").grid(row=0, column=0, sticky="e")
-    entry_product = tk.Entry(frame_form, width=30)
-    entry_product.grid(row=0, column=1)
-
-    tk.Label(frame_form, text="品名:").grid(row=1, column=0, sticky="e")
-    entry_name = tk.Entry(frame_form, width=30)
-    entry_name.grid(row=1, column=1)
-
-    tk.Label(frame_form, text="狀況描述:").grid(row=2, column=0, sticky="e")
-    entry_status = tk.Entry(frame_form, width=60)
-    entry_status.grid(row=2, column=1)
-
-    tk.Label(frame_form, text="變更內容:").grid(row=3, column=0, sticky="e")
-    entry_change = tk.Entry(frame_form, width=60)
-    entry_change.grid(row=3, column=1)
-
-    tk.Label(frame_form, text="相關檔案:").grid(row=4, column=0, sticky="e")
-    entry_file = tk.Entry(frame_form, width=50)
-    entry_file.grid(row=4, column=1)
-
-    def browse_file():
+def create_upload_field_with_update(row, label, folder, field_name, form, product_code_entry, current_user):
+    tk.Label(form, text=label).grid(row=row, column=0, sticky="e")
+    entry = tk.Entry(form, width=50)
+    entry.grid(row=row, column=1)
+    def browse():
         path = filedialog.askopenfilename()
         if path:
-            entry_file.delete(0, tk.END)
-            entry_file.insert(0, path)
+            entry.delete(0, tk.END)
+            entry.insert(0, path)
+    tk.Button(form, text="選擇檔案", command=browse).grid(row=row, column=2)
+    create_sop_update_button(form, row, label, folder, field_name, product_code_entry, entry, current_user)
+    return entry
 
-    btn_file = tk.Button(frame_form, text="選擇檔案", command=browse_file)
-    btn_file.grid(row=4, column=2)
+
+def create_main_interface(root, db_name, login_info):
+    current_user = login_info['user']
+    current_role = login_info['role']
+    can_add = login_info['can_add']
+    can_delete = login_info['can_delete']
+
+    tk.Label(root, text=f"登入者：{current_user} ({current_role})", anchor="e").pack(fill="x", padx=10, pady=5)
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+
+    tabs = {
+        "生產資訊": tk.Frame(notebook),
+        "治具管理": tk.Frame(notebook),
+        "測試BOM": tk.Frame(notebook),
+        "物料清單": tk.Frame(notebook),
+        "帳號管理": tk.Frame(notebook) if current_role == "admin" else None,
+        "操作紀錄": tk.Frame(notebook) if current_role == "admin" else None
+    }
+
+    for name, frame in tabs.items():
+        if frame:
+            notebook.add(frame, text=name)
+
+    if current_role == "admin":
+        build_log_view_tab(tabs["操作紀錄"], db_name)
+        build_user_management_tab(tabs["帳號管理"], db_name, current_user)
+
+    frame = tabs["生產資訊"]
+    form = tk.LabelFrame(frame, text="新增紀錄")
+    form.pack(fill="x", padx=10, pady=5)
+
+    tk.Label(form, text="產品編號:").grid(row=0, column=0, sticky="e")
+    entry_code = tk.Entry(form, width=50)
+    entry_code.grid(row=0, column=1)
+
+    tk.Label(form, text="品名:").grid(row=1, column=0, sticky="e")
+    entry_name = tk.Entry(form, width=50)
+    entry_name.grid(row=1, column=1)
+
+    entry_assembly = create_upload_field_with_update(2, "組裝SOP", ASSEMBLY_SOP_PATH, "assembly_sop", form, entry_code, current_user)
+    entry_test = create_upload_field_with_update(3, "測試SOP", TEST_SOP_PATH, "test_sop", form, entry_code, current_user)
+    entry_packaging = create_upload_field_with_update(4, "包裝SOP", PACKAGING_SOP_PATH, "packaging_sop", form, entry_code, current_user)
+    entry_oqc = create_upload_field_with_update(5, "檢查表OQC", OQC_PATH, "oqc_checklist", form, entry_code, current_user)
 
     def save_data():
-        code = entry_product.get().strip()
+        code = entry_code.get().strip()
         name = entry_name.get().strip()
-        status = entry_status.get().strip()
-        change = entry_change.get().strip()
-        filepath = entry_file.get().strip()
+
         if len(code) not in (8, 10, 12) or not code.isdigit():
-            messagebox.showerror("錯誤", "產品編號必須為 8 / 10 / 12 碼數字")
+            messagebox.showerror("錯誤", "產品編號必須為 8/10/12 碼數字")
             return
-        with sqlite3.connect(DB_NAME) as conn:
+
+        with sqlite3.connect(db_name) as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT product_code FROM issues WHERE product_code=?", (code,))
+            if cursor.fetchone():
+                messagebox.showerror("錯誤", "產品編號已存在，請改用更新功能")
+                return
+
+            a_path = save_file(entry_assembly.get().strip(), ASSEMBLY_SOP_PATH, current_user)
+            t_path = save_file(entry_test.get().strip(), TEST_SOP_PATH, current_user)
+            p_path = save_file(entry_packaging.get().strip(), PACKAGING_SOP_PATH, current_user)
+            o_path = save_file(entry_oqc.get().strip(), OQC_PATH, current_user)
+
             cursor.execute("""
-                INSERT INTO issues (product_code, product_name, status, change, file_path, created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (code, name, status, change, filepath, current_user, datetime.now().isoformat()))
-        messagebox.showinfo("成功", "資料已儲存")
-        for e in [entry_product, entry_name, entry_status, entry_change, entry_file]:
+                INSERT INTO issues (product_code, product_name, assembly_sop, test_sop, packaging_sop, oqc_checklist, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (code, name, os.path.join(ASSEMBLY_SOP_PATH, a_path), os.path.join(TEST_SOP_PATH, t_path),
+                  os.path.join(PACKAGING_SOP_PATH, p_path), os.path.join(OQC_PATH, o_path), current_user, datetime.now().isoformat()))
+            conn.commit()
+
+        messagebox.showinfo("成功", "已新增紀錄")
+        for e in [entry_code, entry_name, entry_assembly, entry_test, entry_packaging, entry_oqc]:
             e.delete(0, tk.END)
         query_data()
 
-    btn_add = tk.Button(frame_form, text="新增紀錄", command=save_data, bg="lightblue",
-                        state="normal" if can_add else "disabled")
-    btn_add.grid(row=5, column=1, pady=10)
-    # === 查詢區塊 ===
-    frame_query = tk.Frame(root)
-    frame_query.pack()
-    tk.Label(frame_query, text="查詢關鍵字 (產品編號/描述/品名):").pack(side="left")
-    entry_query = tk.Entry(frame_query)
-    entry_query.pack(side="left")
+    tk.Button(form, text="新增紀錄", command=save_data, bg="lightblue",
+              state="normal" if can_add else "disabled").grid(row=6, column=1, pady=10)
 
+    query_frame = tk.Frame(frame)
+    query_frame.pack(fill="x", padx=10, pady=5)
+    tk.Label(query_frame, text="查詢關鍵字: ").pack(side="left")
+    entry_query = tk.Entry(query_frame)
+    entry_query.pack(side="left")
     sort_desc = tk.BooleanVar(value=True)
 
     def toggle_sort():
         sort_desc.set(not sort_desc.get())
         query_data()
 
-    btn_sort = tk.Button(frame_query, text="↕排序", command=toggle_sort)
-    btn_sort.pack(side="left", padx=10)
+    tk.Button(query_frame, text="↕排序", command=toggle_sort).pack(side="left", padx=5)
+    tk.Button(query_frame, text="查詢", command=lambda: query_data()).pack(side="left")
 
-    def query_data():
-        for row in tree.get_children():
-            tree.delete(row)
-        keyword = entry_query.get().strip()
-        query = """
-            SELECT id, product_code, product_name, status, change, file_path, created_by, created_at
-            FROM issues
-            WHERE product_code LIKE ? OR status LIKE ? OR change LIKE ? OR product_name LIKE ?
-            ORDER BY created_at {}
-        """.format("DESC" if sort_desc.get() else "ASC")
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, tuple('%' + keyword + '%' for _ in range(4)))
-            for row in cursor.fetchall():
-                tree.insert('', tk.END, values=row)
-
-    btn_query = tk.Button(frame_query, text="查詢", command=query_data)
-    btn_query.pack(side="left")
-    # === 表格 ===
-    columns = ("工單", "產品編號", "品名", "狀況", "變更", "檔案", "使用者", "建立時間")
-    tree = ttk.Treeview(root, columns=columns, show="headings")
+    columns = ("產品編號", "品名", "組裝SOP", "測試SOP", "包裝SOP", "檢查表OQC", "使用者", "建立時間")
+    tree = ttk.Treeview(frame, columns=columns, show="headings")
     for col in columns:
         tree.heading(col, text=col)
-        tree.column(col, width=120 if col != "變更" else 180)
-    tree.pack(fill="both", expand=True)
+        tree.column(col, width=120)
+    tree.pack(fill="both", expand=True, padx=10, pady=5)
 
-    # === 刪除功能按鈕（需權限）===
-    if can_delete:
-        btn_del = tk.Button(root, text="刪除選取紀錄", command=lambda: delete_record(tree), bg="#ff9999")
-        btn_del.pack(pady=5)
+    def query_data():
+        keyword = entry_query.get().strip()
+        for row in tree.get_children():
+            tree.delete(row)
+        with sqlite3.connect(db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT product_code, product_name, assembly_sop, test_sop, packaging_sop, oqc_checklist, created_by, created_at
+                FROM issues
+                WHERE product_code LIKE ? OR product_name LIKE ?
+                ORDER BY created_at {'DESC' if sort_desc.get() else 'ASC'}
+            """, ('%' + keyword + '%', '%' + keyword + '%'))
+            for row in cursor.fetchall():
+                row_display = list(row)
+                for i in range(2, 6):
+                    row_display[i] = os.path.basename(row_display[i]) if row_display[i] else ""
+                tree.insert('', tk.END, values=row_display)
 
-    if current_role == "admin":
-        tk.Button(root, text="帳號管理", command=manage_users).pack(pady=5)
+    def on_double_click(event):
+        item = tree.identify_row(event.y)
+        col = tree.identify_column(event.x)
+        if not item or not col:
+            return
+        col_index = int(col[1:]) - 1
+        if col_index in range(2, 6):
+            filename = tree.item(item)['values'][col_index]
+            base_paths = [ASSEMBLY_SOP_PATH, TEST_SOP_PATH, PACKAGING_SOP_PATH, OQC_PATH]
+            full_path = os.path.join(base_paths[col_index - 2], filename)
+            if os.path.exists(full_path):
+                open_file(full_path)
 
-    root.mainloop()
+    def on_copy(event):
+        focus = tree.focus()
+        if not focus:
+            return
+        col = tree.identify_column(event.x)
+        col_index = int(col[1:]) - 1
+        value = tree.item(focus)['values'][col_index]
+        root.clipboard_clear()
+        root.clipboard_append(str(value))
+        root.update()
+
+    tree.bind("<Double-1>", on_double_click)
+    tree.bind("<Control-c>", on_copy)
+
+def login():
+    result = {"user": None, "role": None, "can_add": 0, "can_delete": 0}
+
+    def try_login():
+        u = entry_user.get().strip()
+        p = entry_pass.get().strip()
+        if not u or not p:
+            messagebox.showerror("錯誤", "請輸入帳號與密碼")
+            return
+
+        hashed_pw = hash_password(p)
+
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
+            c.execute("SELECT role, can_add, can_delete FROM users WHERE username=? AND password=? AND active=1", (u, hashed_pw))
+            r = c.fetchone()
+            if r:
+                result["user"] = u
+                result["role"] = r[0]
+                result["can_add"] = r[1]
+                result["can_delete"] = r[2]
+                login_window.destroy()
+            else:
+                messagebox.showerror("錯誤", "帳號或密碼錯誤或帳號已停用")
+
+    login_window = tk.Tk()
+    login_window.title("登入系統")
+    login_window.geometry("300x180")
+    try:
+        login_window.iconbitmap("Ted64.ico")
+    except:
+        pass
+    tk.Label(login_window, text="使用者名稱：").pack(pady=(15, 5))
+    entry_user = tk.Entry(login_window)
+    entry_user.pack()
+    tk.Label(login_window, text="密碼：").pack(pady=(10, 5))
+    entry_pass = tk.Entry(login_window, show="*")
+    entry_pass.pack()
+    tk.Button(login_window, text="登入", command=try_login).pack(pady=15)
+
+    def on_close():
+        login_window.destroy()
+
+    login_window.protocol("WM_DELETE_WINDOW", on_close)
+    login_window.mainloop()
+
+    return result
+
+if __name__ == "__main__":
+    initialize_database()
+    login_info = login()
+
+    if login_info and login_info.get("user"):
+        root = tk.Tk()
+        root.title("生產資訊平台")
+        root.geometry("1000x750")
+        try:
+            root.iconbitmap("Ted64.ico")
+        except:
+            pass
+        import tkinter.font as tkFont
+        default_font = tkFont.nametofont("TkDefaultFont")
+        default_font.configure(size=10, family="Microsoft Calibri")
+        create_main_interface(root, DB_NAME, login_info)
+        root.mainloop()
+    else:
+        print("⚠️ 使用者未登入或登入失敗，系統結束。")
